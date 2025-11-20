@@ -1,0 +1,27 @@
+# Python build binaries
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE settings (keep these out of the repo)
+.vscode/
+.idea/
+
+# SECURITY - CRITICAL (Block these everywhere)
+.env
+secrets.json
+server/secrets.json
+
+# Output/Log files (Don't commit test results)
+last_solver_result.json
+last_solver_debug.json
+*.log
+
+# Virtual Environments
+.venv/
+venv/
+env/
+*.wav
+# Mac specific clutter
+.DS_Store

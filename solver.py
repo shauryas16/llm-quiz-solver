@@ -17,14 +17,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# Load environment
 load_dotenv()
 
-# AI PIPE Configuration
 AIPIPE_API_KEY = os.getenv("AIPIPE_API_KEY", "")
-AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://api.aipipe.org/openai/v1")
+AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL", "https://aipipe.org/openrouter/v1")
 
-# Initialize LLM client
 llm_client = None
 if AIPIPE_API_KEY:
     try:
@@ -36,7 +33,6 @@ if AIPIPE_API_KEY:
     except Exception as e:
         print(f"Warning: Could not initialize AI PIPE client: {e}")
 
-# Optional imports
 try:
     from word2number import w2n
 except:
@@ -48,10 +44,9 @@ except:
     whisper_pkg = None
 
 # -------------------------
-# HELPER FUNCTIONS (These were missing!)
+# HELPER FUNCTIONS
 # -------------------------
 def extract_api_headers(text: str) -> Dict[str, str]:
-    """Extract API headers from text."""
     headers = {}
     patterns = [
         (r'[Hh]eader[s]?\s*:\s*\{([^}]+)\}', 'json'),
@@ -74,7 +69,6 @@ def extract_api_headers(text: str) -> Dict[str, str]:
     return headers
 
 def parse_html_with_bs4(html: str) -> Dict[str, Any]:
-    """Parse HTML with BeautifulSoup."""
     try:
         soup = BeautifulSoup(html, 'lxml')
         result = {
@@ -82,7 +76,6 @@ def parse_html_with_bs4(html: str) -> Dict[str, Any]:
             "tables": [],
             "links": [],
             "hidden_data": [],
-            "forms": []
         }
         for table in soup.find_all('table'):
             try:
@@ -93,52 +86,51 @@ def parse_html_with_bs4(html: str) -> Dict[str, Any]:
         for link in soup.find_all('a', href=True):
             result["links"].append({"text": link.get_text(strip=True), "href": link['href']})
             
-        # Extract hidden data
-        for attr in ['data-secret', 'data-code', 'data-answer', 'data-value']:
+        # Extract hidden data - CRITICAL FOR "SECRET" QUESTIONS
+        for attr in ['data-secret', 'data-code', 'data-answer', 'data-value', 'value']:
             for elem in soup.find_all(attrs={attr: True}):
-                result["hidden_data"].append(elem.get(attr))
+                val = elem.get(attr)
+                if val and "{" not in val: # Avoid JSON strings
+                    result["hidden_data"].append(val)
+        
+        # Look for hidden elements
+        for elem in soup.find_all(['span', 'div', 'p'], style=lambda x: x and 'display:none' in x.replace(' ', '')):
+            text = elem.get_text(strip=True)
+            if text: result["hidden_data"].append(text)
                 
         return result
     except Exception as e:
         print(f"BS4 error: {e}")
-        return {"text": "", "tables": [], "links": [], "hidden_data": []}
+        return {"text": "", "hidden_data": []}
 
 # -------------------------
 # INTELLIGENT LLM FUNCTIONS
 # -------------------------
 async def llm_understand_question(question_text: str, context: str) -> Dict[str, Any]:
-    """Use LLM to deeply understand what the question is asking."""
     if not llm_client: return {"understood": False}
     try:
-        prompt = f"""Analyze this quiz question carefully and extract:
-1. The specific column name to operate on (if data is tabular).
-2. The filter condition (e.g., "where city is Paris").
-3. The operation (sum, average, count, etc.).
+        # Strengthen prompt to ignore examples
+        prompt = f"""Analyze this quiz question.
+WARNING: The text contains "Example" payloads with placeholder values like "your secret". IGNORE THEM.
+Find the ACTUAL task.
 
 Question: {question_text}
-Context Preview: {context[:500]}
+Context: {context[:1000]}
 
-Return JSON: {{"target_column": "...", "filter": "...", "operation": "...", "answer_format": "..."}}"""
+Return JSON: {{"target_column": "...", "filter": "...", "operation": "...", "is_secret_search": true/false}}"""
 
         response = await llm_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a data analyst helper. JSON response only."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_tokens=300
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
         )
         result = response.choices[0].message.content.strip()
         if result.startswith('```json'): result = result.split('```json')[1].split('```')[0]
         if result.startswith('{'): return json.loads(result)
         return {"understood": True}
-    except Exception as e:
-        print(f"LLM understanding error: {e}")
-        return {"understood": False}
+    except: return {"understood": False}
 
 async def llm_vision_analysis(image_path: str, question: str) -> Optional[str]:
-    """Use GPT-4o Vision to analyze charts or screenshots."""
     if not llm_client: return None
     try:
         with open(image_path, "rb") as image_file:
@@ -149,47 +141,36 @@ async def llm_vision_analysis(image_path: str, question: str) -> Optional[str]:
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"Answer this question based on the image. If it's a number, return just the number. Question: {question}"},
+                    {"type": "text", "text": f"Answer this question based on the image. Question: {question}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ],
             }],
             max_tokens=300,
         )
         return response.choices[0].message.content
-    except Exception as e:
-        print(f"Vision error: {e}")
-        return None
+    except: return None
 
 async def llm_solve_with_reasoning(question: str, data: str, question_understanding: Dict) -> Dict[str, Any]:
-    """Use LLM with chain-of-thought reasoning."""
     if not llm_client: return {"success": False}
     try:
-        prompt = f"""Solve this data problem step-by-step.
+        prompt = f"""Solve this data problem.
 Question: {question}
-Data Excerpt: {data[:3000]}
+Data: {data[:4000]}
 MetaData: {json.dumps(question_understanding)}
 
-Return strictly JSON:
-{{
-    "answer": <final_answer>,
-    "confidence": <0.0-1.0>
-}}"""
+Return strictly JSON: {{"answer": <final_answer>}}"""
         response = await llm_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a precise solver. Output JSON only."},
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
         result = response.choices[0].message.content.strip()
         if "```" in result: result = result.split("```json")[-1].split("```")[0]
         return {"success": True, "result": json.loads(result.strip())}
-    except:
-        return {"success": False}
+    except: return {"success": False}
 
 # -------------------------
-# DATA PROCESSING & UTILITIES
+# UTILITIES
 # -------------------------
 def intelligent_column_match(df: pd.DataFrame, target_hint: str) -> Optional[str]:
     if not target_hint or target_hint.lower() == "none":
@@ -230,8 +211,7 @@ def extract_and_sum_numbers(text: str) -> float:
     if not nums: return 0.0
     total = 0.0
     for n in nums:
-        val = float(n)
-        total += val
+        total += float(n)
     return total
 
 async def transcribe_audio_with_fallbacks(path):
@@ -252,6 +232,21 @@ async def transcribe_audio_with_fallbacks(path):
 # -------------------------
 # STRATEGIES
 # -------------------------
+class HiddenDataStrategy:
+    async def try_solve(self, context: Dict) -> Tuple[Optional[Any], float]:
+        parsed = context.get("parsed_data", {})
+        hidden = parsed.get("hidden_data", [])
+        text = context.get("text", "").lower()
+        
+        # If the question asks for a "secret" or "code", and we found hidden data
+        if hidden and ("secret" in text or "code" in text or "hidden" in text):
+            print(f"[HiddenData] Found potential secrets: {hidden}")
+            # Return the first one that looks like a secret (not "your secret")
+            for h in hidden:
+                if "your secret" not in h.lower():
+                    return h, 0.95
+        return None, 0.0
+
 class DataFileStrategy:
     async def try_solve(self, context: Dict) -> Tuple[Optional[Any], float]:
         data_files = context.get("data_files", [])
@@ -291,9 +286,11 @@ class ImageStrategy:
 class AudioStrategy:
     async def try_solve(self, context: Dict) -> Tuple[Optional[Any], float]:
         audio_files = context.get("audio_files", [])
-        if not audio_files: return None, 0.0
+        if not audio_files: 
+            print("[AudioStrategy] No audio files found.")
+            return None, 0.0
         
-        print("[AudioStrategy] Transcribing...")
+        print(f"[AudioStrategy] Transcribing {audio_files[0]}...")
         transcript = await transcribe_audio_with_fallbacks(audio_files[0])
         if transcript:
             print(f"[AudioStrategy] Transcript: {transcript[:50]}...")
@@ -311,15 +308,7 @@ async def solve_quiz(payload: dict) -> dict:
     if not quiz_url: return {"error": "No URL"}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--no-sandbox",
-            ]
-        )
+        browser = await p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"])
         context_browser = await browser.new_context()
         page = await context_browser.new_page()
         
@@ -368,8 +357,8 @@ async def solve_quiz(payload: dict) -> dict:
                             df = await process_data_file(tmp, ext)
                             if df is not None: context["data_files"].append({"dataframe": df, "path": tmp})
 
-                # Audio
-                audio_links = re.findall(r'(?:href|src)=["\']([^"\']+\.(mp3|wav|m4a))["\']', html, re.IGNORECASE)
+                # Audio - IMPROVED REGEX
+                audio_links = re.findall(r'(?:href|src)=["\']([^"\']+\.(mp3|wav|m4a|ogg))["\']', html, re.IGNORECASE)
                 for link, ext in audio_links:
                     url = normalize_url(link, quiz_url)
                     if url:
@@ -386,8 +375,13 @@ async def solve_quiz(payload: dict) -> dict:
                         if await download_file(url, client, tmp, api_headers):
                             context["images"].append(tmp)
 
-            # 4. EXECUTE STRATEGIES
-            strategies = [DataFileStrategy(), AudioStrategy(), ImageStrategy()]
+            # 4. EXECUTE STRATEGIES (Order matters!)
+            strategies = [
+                HiddenDataStrategy(), # Try to find secret first
+                DataFileStrategy(), 
+                AudioStrategy(), 
+                ImageStrategy()
+            ]
             for strat in strategies:
                 ans, conf = await strat.try_solve(context)
                 if ans is not None and conf > 0.8:
